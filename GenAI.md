@@ -35,33 +35,473 @@ Inside each transformer block, the most important pieces are:
 
 Detailed transformer mechanics are covered in the **Transformers** section below.
 
-### Training Pipeline
+### Full Training Pipeline
+
+LLM training is a three-phase pipeline:
+
+- **Pretraining**
+- **Supervised Fine-Tuning (SFT)**
+- **Alignment** through approaches such as **RLHF**, **DPO**, or **Constitutional AI / RLAIF**
+
+Each phase has a different objective, different data, and a different role in producing the final deployed model. A neural network starts with random weights and learns by repeatedly making predictions, measuring error, and adjusting weights to reduce that error. Training is the only phase where model weights are updated. Once deployed, the model is frozen and does not learn from user interactions.
 
 ```text
-Raw Text Corpus -> Tokenization -> Pretraining (next-token prediction)
--> Pretrained Base Model -> SFT -> RLHF / DPO / RLAIF
+Raw Text Corpus
+-> [Pretraining]
+-> Base Model
+-> [SFT]
+-> Instruction-Following Model
+-> [RLHF / DPO / RLAIF]
 -> Aligned Assistant Model
 ```
 
-**Pretraining** usually uses **next-token prediction**. The model sees a token sequence and learns to predict the next token. This objective is simple, self-supervised, and extremely scalable. At large enough scale, it forces the model to internalize grammar, factual associations, coding patterns, and many reasoning-like behaviors.
+End-to-end training flow:
 
-**Post-training alignment** then turns a raw base model into a usable assistant:
+```text
+PHASE 1 - PRETRAINING
+Raw Text Corpus
+-> Data Cleaning / Deduplication / Quality Filtering
+-> Tokenized Dataset
+-> Forward Pass -> Cross-Entropy Loss -> Backpropagation -> AdamW Update
+-> Repeat at massive scale across distributed GPUs
+-> Base Model
 
-1. **SFT (Supervised Fine-Tuning)** -> train on instruction-response examples
-2. **RLHF** -> use human preference rankings and optimize the model toward preferred outputs
-3. **RLAIF / Constitutional AI** -> use AI feedback guided by principles instead of relying only on human labeling
-4. **DPO (Direct Preference Optimization)** -> a simpler preference-optimization alternative that avoids the full RLHF loop
+PHASE 2 - SFT
+Instruction-Response Pairs
+-> Same next-token loss, usually only on response tokens
+-> Full fine-tuning or LoRA / QLoRA
+-> SFT Model
+
+PHASE 3 - ALIGNMENT
+SFT Model
+-> RLHF or DPO or Constitutional AI / RLAIF
+-> Aligned Assistant Model
+```
+
+#### Phase 1 - Pretraining
+
+**Objective:** learn language, world knowledge, code patterns, and reasoning structures from raw text at massive scale. This is by far the most expensive phase and where most of the model's capability comes from.
+
+**Task - Next-Token Prediction:** the model sees a token sequence and must predict the next token at each position. This is **self-supervised** because the training signal comes from the text itself; no human labels are needed. Given:
+
+```text
+"The cat sat on the"
+```
+
+the model should predict:
+
+```text
+"mat"
+```
+
+This simple objective becomes extremely powerful at trillion-token scale because the model must internalize grammar, syntax, facts, code patterns, reasoning-like patterns, and broad world regularities in order to make good predictions.
+
+**Training data:** pretraining corpora usually include web text, books, Wikipedia, code, academic papers, forums, and curated high-quality sources. Data quality matters as much as scale. Raw internet text is noisy, so modern pipelines rely heavily on:
+
+- deduplication
+- toxicity filtering
+- language identification
+- document quality scoring
+- source balancing
+
+The ratio of web data, books, code, scientific text, and curated sources strongly shapes model behavior and capability.
+
+**Scaling laws:** modern training follows the idea that for a fixed compute budget, model size and number of training tokens must be balanced carefully. This is the core insight from **Chinchilla scaling laws**.
+
+**Forward pass:** the full pretraining forward pass looks like:
+
+```text
+Input Tokens
+-> Embedding Layer
+-> Transformer Blocks
+-> LM Head
+-> Logits
+-> Softmax
+-> Predicted Probability Distribution
+```
+
+**Loss function - Cross-Entropy**
+
+```text
+Loss = -log(P(actual_next_token))
+```
+
+If the model assigns high probability to the true next token, the loss is low. If the probability is low, the loss is high. This loss is computed across many token positions in parallel in every batch.
+
+**Backpropagation:** gradients are computed for all model parameters using the chain rule. Those gradients flow backward from the **LM Head**, through all transformer blocks, and back to the embedding layer. Each gradient tells the optimizer how to adjust that weight to reduce loss.
+
+**Optimizer - AdamW:** most modern LLMs are trained with **AdamW**, which maintains:
+
+- a running average of gradients
+- a running average of squared gradients
+- weight decay for regularization
+
+This makes training much more stable than plain SGD.
+
+**Learning rate schedule:** training usually uses:
+
+- **warmup** -> gradually increase learning rate early in training
+- **decay** -> reduce learning rate later for stable convergence
+
+Common practice is linear warmup followed by cosine decay.
+
+**Gradient clipping:** prevents rare but catastrophic gradient spikes from destabilizing training.
+
+**Mixed precision training:** training at scale usually uses **BF16** for efficiency, while keeping some optimizer states in higher precision for stability.
+
+**Distributed training:** frontier-scale models do not fit on a single GPU. Modern training combines multiple strategies:
+
+- **Data Parallelism** -> replicate the model, split the batch across GPUs, then average gradients
+- **Tensor Parallelism** -> shard large weight matrices across GPUs
+- **Pipeline Parallelism** -> split transformer layers across devices
+- **ZeRO / optimizer sharding** -> shard optimizer states, gradients, and parameters to reduce redundancy
+
+This is how training scales to thousands of GPUs and trillions of tokens.
+
+The result of pretraining is a **base model**. It knows language, facts, code, and many reasoning patterns, but it does not yet know how to behave like a helpful assistant.
+
+#### Phase 2 - Supervised Fine-Tuning (SFT)
+
+**Problem SFT solves:** a pretrained model is just a text completer. It can continue text, but it does not inherently know how to follow instructions, act like an assistant, or format answers helpfully.
+
+**Objective and data:** the model is fine-tuned on high-quality human-written instruction-response pairs. The learning objective is still next-token prediction, but the loss is usually applied only to the response tokens while the instruction tokens are masked.
+
+This teaches the model:
+
+- instruction following
+- assistant-style formatting
+- conversational response patterns
+- better task behavior
+
+Quality matters more than raw quantity. A relatively small but carefully curated SFT dataset can shift behavior dramatically.
+
+**Full Fine-Tuning vs PEFT**
+
+**Full fine-tuning** updates all weights. It is expensive and increases the risk of catastrophic forgetting.
+
+**Parameter-Efficient Fine-Tuning (PEFT)** keeps the base model mostly frozen and updates only a small subset of parameters.
+
+Important PEFT methods:
+
+- **LoRA** -> learn low-rank update matrices instead of updating full weight matrices
+- **QLoRA** -> apply LoRA to a quantized base model, making large-model fine-tuning much cheaper
+- **Prefix Tuning / Prompt Tuning** -> learn soft prompt vectors prepended to the input
+
+**Catastrophic forgetting:** if you fine-tune too aggressively on a narrow dataset, the model can lose broad pretrained capability. Common mitigations include:
+
+- lower learning rates
+- early stopping
+- LoRA / QLoRA
+- careful dataset design
+
+The output of this stage is an **SFT model**. It follows instructions, but it is not yet fully aligned for safety, honesty, or human preferences.
+
+#### Phase 3 - Alignment
+
+**Problem alignment solves:** SFT teaches the model to respond like an assistant, but it does not fully ensure helpfulness, honesty, harmlessness, calibrated uncertainty, or human-preferred behavior. Alignment is the stage that shapes those properties.
+
+#### RLHF
+
+**RLHF (Reinforcement Learning from Human Feedback)** works like this:
+
+```text
+SFT model generates multiple responses
+-> Human raters rank them
+-> Reward Model is trained on the rankings
+-> PPO fine-tunes the LLM to maximize reward
+-> Aligned model
+```
+
+Key pieces:
+
+- **Reward Model** -> predicts which outputs humans prefer
+- **PPO** -> reinforcement learning method used to push the model toward higher reward
+- **KL divergence penalty** -> keeps the model from drifting too far from the SFT policy and helps prevent reward hacking
+
+RLHF was foundational for early frontier assistants, but it is expensive, labor-intensive, and can be unstable.
+
+#### DPO
+
+**DPO (Direct Preference Optimization)** is a simpler alternative. Instead of training a reward model and then running PPO, DPO directly trains the LLM on preference pairs:
+
+```text
+Prompt + Chosen Response + Rejected Response
+-> Direct loss on the LLM
+-> Aligned model
+```
+
+Advantages:
+
+- simpler pipeline
+- no separate reward model
+- no RL loop
+- often more stable in practice
+
+This is why DPO is increasingly popular in modern open and production alignment pipelines.
+
+#### Constitutional AI / RLAIF
+
+**Constitutional AI** and **RLAIF (Reinforcement Learning from AI Feedback)** aim to scale alignment without depending entirely on large human rater teams.
+
+Typical flow:
+
+```text
+LLM generates response
+-> LLM critiques response using constitutional principles
+-> LLM revises response
+-> Revised outputs are used for SFT-style training
+-> AI-generated rankings are used for preference optimization
+-> Aligned model
+```
+
+This makes alignment more scalable and more explicitly principle-driven.
+
+#### Key Interview Concepts
+
+- **Reward hacking** -> the model finds ways to maximize reward without actually improving quality
+- **Catastrophic forgetting** -> narrow fine-tuning causes loss of broad pretrained capability
+- **Stability-plasticity dilemma** -> the more adaptable a model is to new data, the more likely it is to forget older knowledge
+- **Data quality > data quantity** -> better filtered data often beats larger but noisier data
+- **Chinchilla scaling laws** -> good performance depends on balancing model size and training tokens, not just maximizing parameters
+
+#### Training Pipeline Real-World Usage
+
+- **InstructGPT / ChatGPT-style systems** -> classic example of SFT plus RLHF producing assistant behavior
+- **LLaMA-family fine-tuning** -> LoRA and QLoRA made domain adaptation practical even on much smaller hardware
+- **Claude-style alignment** -> Constitutional AI and RLAIF reduce dependence on large human ranking teams
+- **Enterprise adaptation** -> organizations often start from a base or instruction-tuned model and use PEFT methods for domain-specific specialization
 
 ### Inference
 
-LLMs generate output **autoregressively**, one token at a time. Each newly generated token is appended back into the context and used to predict the next one.
+Inference is the process of using a trained, frozen LLM to generate responses. Training happens once; inference happens continuously in production and is what actually drives most real-world serving cost. The model weights do not change during inference. Every API call to OpenAI, Anthropic, Gemini, a self-hosted vLLM server, or a local model runner is an inference call.
 
-Two phases are useful to remember:
+From an interview and systems-design perspective, inference is one of the most important practical topics because most application engineers work far more with **serving**, **latency**, **throughput**, and **cost optimization** than with model training itself.
 
-- **Prefill** -> the input prompt is processed in parallel
-- **Decode** -> output tokens are generated sequentially
+#### End-to-End Inference Pipeline
 
-This is why long prompts and long outputs behave differently in latency. During decode, **KV Cache** stores attention key-value states so earlier tokens do not need to be recomputed every step. This is one of the most important inference optimizations in production. Streaming responses show tokens as they are produced during decode.
+```text
+User Request
+-> API Gateway / Load Balancer
+-> Inference Server Queue (vLLM / TGI style serving)
+-> Full Context Assembly
+   [System Prompt] + [History] + [RAG Chunks] + [User Query]
+-> PREFILL
+   all input tokens processed in parallel
+   KV Cache populated
+   first output token generated
+-> first token streamed to user
+-> DECODE LOOP
+   one token at a time using KV Cache reuse
+-> stop token or max_tokens reached
+-> final response complete
+```
+
+#### The Two Phases of Inference
+
+Every inference request has two computationally different phases:
+
+##### Prefill
+
+During **prefill**, the full known input context is processed in one parallel forward pass.
+
+This includes:
+
+- system prompt
+- conversation history
+- RAG-retrieved chunks
+- the latest user query
+
+Because all these tokens are known upfront, the model can process them in parallel through all transformer layers. The output of this phase is:
+
+- a populated **KV Cache**
+- the first predicted output token
+
+Important point:
+
+- **prefill latency is driven mostly by input length**
+- the key UX metric here is **TTFT (Time To First Token)**
+
+##### Decode
+
+During **decode**, the model generates output autoregressively, one token at a time.
+
+At each step:
+
+- the newest token is fed into the model
+- the model reuses the **KV Cache**
+- one more output token is produced
+- that token can be streamed immediately
+
+Important point:
+
+- **decode latency is driven mostly by model size and number of output tokens**
+- the key metric here is **TPOT (Time Per Output Token)**
+
+Simple view:
+
+```text
+PREFILL
+All input tokens -> processed in parallel
+-> KV Cache + Token_1
+
+DECODE
+Token_1 -> Token_2
+Token_2 -> Token_3
+Token_3 -> Token_4
+...
+```
+
+#### Key Inference Metrics
+
+- **TTFT (Time To First Token)** -> how quickly the user sees the first streamed token
+- **TPOT (Time Per Output Token)** -> streaming speed after generation begins
+- **Throughput** -> total tokens served per second across concurrent users
+
+#### KV Cache - Most Important Inference Optimization
+
+During decode, self-attention needs access to the **Key** and **Value** matrices for all prior tokens. Without caching, those would be recomputed repeatedly, making generation far more expensive.
+
+The **KV Cache** stores these matrices in memory so that at each decode step only the new token's K and V need to be computed.
+
+Why it matters:
+
+- makes autoregressive generation practical
+- reduces repeated computation
+- is one of the most important optimizations in modern serving
+
+Tradeoff:
+
+- the KV Cache can become extremely large for long contexts
+- long context windows directly increase memory usage per request
+- this reduces how many concurrent requests one GPU can serve
+- for very large models and long contexts, KV cache memory can become comparable to or larger than the effective active model footprint during serving
+
+**Prompt caching** is a related provider-level optimization. If the same prompt prefix appears repeatedly, providers can reuse cached computations for that prefix and reduce both latency and cost. In practice, this is why static content such as system prompts, few-shot examples, and reusable prompt prefixes should be placed at the very beginning of context and kept stable across requests.
+
+#### Quantization - Running Models More Cheaply
+
+Quantization reduces model precision so that weights use less memory and inference becomes cheaper and faster.
+
+Useful rule of thumb:
+
+- **BF16** uses about 2 bytes per parameter
+- a 70B model in BF16 therefore needs roughly 140GB just for weights
+- this is why quantization is often necessary for practical self-hosted inference
+
+Common forms:
+
+- **INT8** -> lower memory with very small quality loss; safe default for many production use cases
+- **INT4 / 4-bit** -> much smaller memory footprint; useful when hardware is constrained, though some reasoning quality may drop
+- **AWQ** -> stronger 4-bit quantization that preserves activation-sensitive weights better
+- **GPTQ** -> post-training quantization optimized to minimize reconstruction error
+- **GGUF / llama.cpp formats** -> optimized for local and consumer hardware inference
+- **QLoRA** -> mainly a fine-tuning technique, but important to understand because it combines quantization with LoRA to make large models practical on smaller hardware
+
+Rule of thumb:
+
+- **INT8** is usually close to lossless
+- **INT4** is often acceptable for many practical tasks
+- going much lower than 4-bit usually causes larger quality degradation
+
+#### Batching - Maximizing GPU Utilization
+
+GPUs are most efficient when many requests are served together.
+
+**Static batching** groups requests into one batch and processes them together, but it is inefficient because short requests may have to wait for long ones.
+
+**Continuous batching** is the dominant modern approach. New requests join the running batch dynamically as soon as a slot is free, which reduces GPU idle time and improves throughput significantly.
+
+```text
+Continuous batching:
+Slot 1: [Req A][decode][decode][done]
+Slot 2: [Req B][decode][done]
+Slot 3: [Req C][decode][decode][decode][done]
+Slot 4:                [Req D][prefill][decode][decode]
+```
+
+This is one of the main reasons systems like **vLLM** and **TGI** are so effective for self-hosted serving.
+
+#### Prefill-Decode Disaggregation
+
+At very large scale, some systems separate prefill and decode onto different serving resources.
+
+Why this helps:
+
+- **prefill** is more compute-bound
+- **decode** is more memory-bandwidth-bound
+- different hardware setups may be better for one phase than the other
+
+This is mainly a hyperscaler optimization, but it is useful to know because it shows that prefill and decode are not just logically different; they are also different from a systems-performance perspective.
+
+#### PagedAttention and vLLM
+
+Naive KV-cache allocation can waste large amounts of memory by reserving more space than a sequence actually needs.
+
+**PagedAttention** fixes this by splitting KV cache storage into fixed-size blocks and allocating them on demand, similar to virtual memory paging in operating systems.
+
+Why it matters:
+
+- reduces memory fragmentation
+- increases concurrent request capacity
+- is a major reason **vLLM** became the dominant self-hosted inference server
+
+#### Speculative Decoding
+
+Speculative decoding uses a small fast draft model to guess several next tokens ahead, and then a larger target model verifies them in parallel.
+
+If the large model agrees, multiple tokens are accepted at once. If not, generation falls back at the disagreement point.
+
+Why it matters:
+
+- improves inference speed substantially
+- can give 2-3x speedups in the right setup
+- preserves output quality when verification is done correctly
+
+#### Inference-Time Scaling
+
+Another important idea is **test-time compute** or **inference-time scaling**. Instead of always using a larger model, systems spend more compute during inference to improve answer quality.
+
+Examples:
+
+- **Chain-of-Thought (CoT)** -> generate intermediate reasoning steps
+- **Self-Consistency** -> generate multiple candidate answers and vote
+- **Best-of-N Sampling** -> generate N outputs and choose the best with a verifier or reward function
+- **reasoning-first models** -> allocate more internal compute for hard problems before responding
+
+This increases cost, but often improves reliability and accuracy on difficult tasks.
+
+#### Hosted API vs Self-Hosted Inference
+
+| Aspect | Hosted API | Self-Hosted |
+| --- | --- | --- |
+| Setup | Very easy | Significant infra work |
+| Cost at low scale | Usually better | Usually worse |
+| Cost at high scale | Can become very expensive | Can become cheaper |
+| Data privacy | External provider | Full internal control |
+| Model control | Limited | Full control and fine-tuning |
+| Latency | Shared infra | More predictable if dedicated |
+| Compliance | Harder in regulated industries | Easier to control directly |
+
+At sufficiently high token volume, self-hosting often becomes economically attractive, especially when privacy or compliance also matters.
+
+#### Real-World Usage
+
+- **Hosted APIs at scale** -> rely on batching, prompt caching, and specialized serving infrastructure across large GPU fleets
+- **OpenAI / Anthropic style serving** -> repeated prompt prefixes benefit from provider-side prompt caching and large-scale decode optimization
+- **Groq-style serving** -> shows that decode is often limited more by memory bandwidth than pure compute
+- **Ollama / local development** -> runs quantized models locally for privacy and zero per-call API cost
+- **Streaming web apps** -> send decode-phase tokens to the browser as they are generated so users do not wait for the full response
+- **Next.js / Vercel-style integrations** -> often stream tokens over SSE or web streams because non-streaming UX becomes poor for longer decode phases
+
+#### Production Implications
+
+- always stream responses in user-facing applications when possible
+- keep prompt prefixes stable to maximize prompt-cache benefits
+- monitor **TTFT** and **TPOT** separately because they have different bottlenecks
+- long contexts increase KV-cache memory and reduce concurrency
+- quantization is often essential for efficient self-hosted serving
+- continuous batching is one of the biggest throughput optimizations in production
+- at higher scale, self-hosting can become cheaper than API pricing depending on workload and hardware
 
 ### Mixture of Experts (MoE)
 
@@ -354,6 +794,331 @@ Other practical notes:
 - **Where** -> inside LLM processing, semantic search, vector databases, recommendation systems, and retrieval pipelines
 - **When** -> when the system needs similarity matching, retrieval, clustering, or semantic understanding
 
+## Vector Databases
+
+A **vector database** is a database purpose-built to store, index, and search high-dimensional vectors (**embeddings**) at scale. Unlike traditional databases that find records by exact value matching, vector databases find records by **semantic similarity** — returning vectors mathematically closest to a query vector. This operation is called **Approximate Nearest Neighbor (ANN) search** and is the core primitive that makes production **RAG** systems, semantic search, and embedding-based recommendation viable.
+
+Traditional databases fail for vector search for two reasons:
+
+- SQL keyword matching such as `LIKE '%term%'` misses semantically equivalent content written with different words
+- brute-force cosine similarity against every stored vector is `O(n)` and becomes intractable at scale
+
+The deeper reason naive spatial indexing fails is the **curse of dimensionality**. In high-dimensional spaces such as `768-3072` dimensions, all vectors become roughly equidistant, so tree-based spatial indexes like k-d trees and R-trees degrade toward brute-force performance. ANN algorithms solve this by exploiting the structure and connectivity of the data rather than relying on naive geometric partitioning.
+
+### Indexing and Retrieval Pipeline
+
+```text
+INDEXING (offline, once):
+Raw Documents
+-> Chunking (256-512 tokens, 10-20% overlap, semantic boundaries)
+-> Embedding Model
+-> Dense Vectors + Metadata (text, source, user_id, timestamp)
+-> Vector DB builds ANN index (HNSW in RAM / IVF on disk)
+
+QUERYING (real-time, per request):
+User Query
+-> Same Embedding Model
+-> Query Vector
+-> ANN Search (HNSW traversal / IVF cluster search)
+   + Metadata Filter applied inline
+-> Top-50 Dense Candidates
+-> BM25 Sparse Retrieval in parallel
+-> Top-50 Sparse Candidates
+-> RRF Fusion
+-> Cross-Encoder Re-ranker
+-> Top-5 Final Chunks
+-> Original Text injected into LLM Context
+-> Grounded Response
+```
+
+Critical rule:
+
+- always use the **exact same embedding model** for indexing and querying
+- vectors from different models live in different geometric spaces
+- switching embedding models requires re-embedding the corpus and rebuilding the index
+
+### Core Indexing Algorithms
+
+#### HNSW - Hierarchical Navigable Small World
+
+Think of **HNSW** like Google Maps navigation. You do not start a long trip by driving every local street. You first use highways to cover distance quickly, then smaller roads to get precise. HNSW builds exactly that kind of layered structure for vector search.
+
+HNSW builds a multi-layer graph where each vector is a node:
+
+- **Layer 0** contains all vectors
+- higher layers contain progressively fewer nodes
+- upper layers act like highways for long-distance traversal
+- lower layers handle local precise navigation
+
+Insertion:
+
+- a new vector is assigned a maximum layer probabilistically
+- at each occupied layer, it connects to its nearest neighbors
+- weaker edges are pruned to preserve graph quality
+
+Search:
+
+- start at the entry point of the top layer
+- greedily move to the neighbor closest to the query
+- descend when no closer neighbor exists
+- at layer 0, perform a beam search with width `ef_search`
+- return the final top-K results
+
+**Example - Support Article Search:** imagine 5 million support articles indexed with HNSW. Top layers quickly route the query into the right topic area, and the bottom layer finds the most relevant local articles. This is why HNSW can search huge corpora in milliseconds instead of tens of seconds.
+
+Important parameters:
+
+- **M** -> number of bidirectional connections per node; higher means better recall but more RAM
+- **ef_construction** -> beam width during index build; higher means better graph quality but slower build
+- **ef_search** -> beam width during query time; tunable per query, higher for recall and lower for speed
+
+Complexity:
+
+- search is roughly `O(log N)`
+- build is roughly `O(N log N)`
+
+Primary weakness:
+
+- the graph must reside in RAM
+- at very large scale, memory usage becomes the main bottleneck
+
+Common in **Pinecone**, **Weaviate**, **Qdrant**, **Chroma**, **pgvector**, and **Redis VSS**.
+
+HNSW intuition:
+
+```text
+Layer 2: A ---------------- B
+Layer 1: A --- C --- D --- B --- E
+Layer 0: A-F-G-C-H-I-D-J-K-B-L-M-E-N-O
+
+Query: enter top layer
+     -> greedy traverse toward query
+     -> descend layers
+     -> beam search at bottom layer
+     -> return top-K
+```
+
+#### IVF - Inverted File Index
+
+Think of **IVF** like a library organized into sections. Instead of searching every book, you first identify which sections are most relevant, then search only within those sections.
+
+IVF works by:
+
+- clustering all vectors into `K` groups using k-means
+- assigning each vector to its nearest centroid
+- storing an inverted list from centroid to member vectors
+
+Search works like this:
+
+- compare the query vector to all centroids
+- select the nearest `nprobe` centroids
+- search only inside those clusters
+- return the top-K results
+
+**Example - E-commerce Search:** if 2 million products are clustered into 1,000 groups, a query such as "wireless noise-cancelling headphones" only searches the most relevant nearby clusters rather than all products.
+
+Important parameters:
+
+- **nlist** -> number of clusters
+- **nprobe** -> how many clusters to search at query time
+
+Tradeoff:
+
+- more clusters = faster cluster-level search but more boundary misses
+- higher `nprobe` = better recall but slower queries
+
+Key weakness:
+
+- true nearest neighbors can be missed if they fall into non-searched clusters
+- this is the core **cluster boundary problem**
+
+Main advantage over HNSW:
+
+- more memory-efficient
+- vectors can live on disk more easily
+- useful at much larger scale
+
+#### IVF + PQ - Product Quantization
+
+**IVF + PQ** combines cluster-based narrowing with aggressive vector compression.
+
+Product Quantization works by:
+
+- splitting a vector into multiple subvectors
+- learning a codebook for each subvector position
+- replacing each subvector with a compact codebook index
+
+This can shrink a large float32 vector dramatically and make distance computation much faster via lookup tables instead of full floating-point operations.
+
+**Example - Billion-Scale Search:** at very large scale, storing raw vectors may require terabytes of memory. IVF + PQ reduces that drastically, making billion-scale search practical where full-fidelity HNSW would be too expensive.
+
+Tradeoff:
+
+- strong memory savings
+- lower recall than HNSW
+- best used when memory constraints dominate
+
+#### ScaNN - Scalable Approximate Nearest Neighbor
+
+**ScaNN** is Google's production ANN algorithm used in systems like Search and YouTube. Its key idea is **anisotropic quantization**: not all quantization errors matter equally. Errors aligned with the query direction affect ranking much more than errors in irrelevant directions.
+
+This makes ScaNN especially strong at preserving retrieval quality under compression. It is important conceptually even though it is less commonly surfaced directly in third-party vector database products than HNSW.
+
+### Metadata Filtering
+
+Production queries almost always combine semantic similarity with metadata constraints.
+
+Two naive approaches both fail:
+
+- **post-filtering** -> run ANN search first, then filter; relevant results may be lost if most candidates are filtered out
+- **pre-filtering** -> filter first, then search only the subset; this can degrade toward brute force
+
+**Example - Multi-tenant SaaS Knowledge Base:** if a global ANN search returns mostly documents from the wrong customer, a naive post-filter wastes the best candidates. If you filter first and then search a narrow slice inefficiently, you lose ANN efficiency. Modern vector databases solve this by integrating filtering directly into the ANN traversal itself.
+
+### Hybrid Search - Dense + Sparse
+
+Pure semantic search misses exact keyword matches that genuinely matter:
+
+- product IDs
+- acronyms
+- legal terms
+- version numbers
+- proper nouns
+
+Pure sparse retrieval such as **BM25** has the opposite weakness: it matches exact words but misses meaning.
+
+Production systems therefore combine both:
+
+- **Dense retrieval** -> ANN over embeddings for semantic similarity
+- **Sparse retrieval** -> BM25-style lexical matching for exact terms
+- **Fusion** -> combine dense and sparse rankings, often with **Reciprocal Rank Fusion (RRF)**
+
+**RRF** works by combining reciprocal ranks such as:
+
+`1 / (rank + k)`
+
+across both ranked lists, so documents that rank well in both dense and sparse retrieval are strongly favored.
+
+This is the recommended production default for many retrieval systems.
+
+### Hybrid Retrieval Flow
+
+```text
+User Query
+-> Dense Embedding Model -> Query Vector
+-> Sparse Retrieval / BM25 Query
+
+Dense Retrieval Path:
+Query Vector -> ANN Search -> Dense Candidates
+
+Sparse Retrieval Path:
+Keyword Query -> BM25 / Sparse Search -> Sparse Candidates
+
+Fusion:
+Dense Candidates + Sparse Candidates
+-> Reciprocal Rank Fusion (RRF) or learned fusion
+-> Top-N Combined Candidates
+-> Cross-Encoder Re-ranker
+-> Top-K Final Chunks
+-> Inject into LLM Context
+-> Grounded Response
+```
+
+### Re-Ranking - Precision Layer
+
+ANN gets you into the right neighborhood quickly. **Re-ranking** finds the best results inside that neighborhood precisely.
+
+**Bi-encoder retrieval stage:**
+
+- query and documents are encoded separately
+- similarity is computed via vector comparison
+- fast because document embeddings are precomputed
+- less precise because query and document never interact during encoding
+
+**Cross-encoder re-rank stage:**
+
+- query and candidate chunk are processed together in one transformer
+- full attention across both inputs produces much better relevance estimates
+- much slower, so it is only used on a small shortlist
+
+Typical production pattern:
+
+```text
+ANN retrieves top-50 candidates
+-> Cross-encoder re-ranks all 50
+-> Top-5 injected into LLM context
+```
+
+This is one of the highest-ROI improvements to production RAG quality.
+
+### Chunking Strategy - Retrieval Quality Ceiling
+
+Retrieval quality is fundamentally bounded by chunking quality. No ANN algorithm can recover semantic structure that was destroyed during poor chunking.
+
+Key failure modes:
+
+- **too large** -> chunks mix multiple topics and retrieval becomes noisy
+- **too small** -> chunks lack enough standalone meaning
+- **no overlap** -> meaning that spans chunk boundaries is lost
+
+Important strategies:
+
+- **fixed-size chunking** -> simple and predictable, but can split mid-sentence
+- **recursive chunking** -> split by paragraph, then sentence, then smaller units; strong practical default
+- **semantic chunking** -> split where similarity between adjacent sentences drops sharply
+- **parent-child chunking** -> index small chunks but inject larger parent context when retrieved
+
+Good default range:
+
+- **256-512 tokens**
+- **10-20% overlap**
+
+### Vector DB Landscape
+
+| Database | Type | Algorithm | Best For | Key Highlights |
+| --- | --- | --- | --- | --- |
+| **Pinecone** | Managed cloud | HNSW + proprietary | Production RAG | Fully managed, serverless tier, native hybrid search |
+| **Weaviate** | OSS / cloud | HNSW | Hybrid search, multi-modal | GraphQL API, native BM25 hybrid, rich module ecosystem |
+| **Qdrant** | OSS / cloud | HNSW | Complex filtering | Rust-based, strong payload indexing, sparse vector support |
+| **Chroma** | OSS | HNSW | Local dev / prototyping | Simple setup, common LangChain default |
+| **Milvus** | OSS / cloud | IVF+PQ, HNSW | Billion-scale | Large-scale open-source option |
+| **pgvector** | PostgreSQL extension | HNSW, IVF | Existing Postgres infra | No new infra, SQL joins with vectors |
+| **Redis VSS** | Redis extension | HNSW | Ultra-low latency | Good fit for Redis-heavy stacks |
+| **FAISS** | Library (Meta) | IVF+PQ, HNSW | Research / custom builds | In-process library, not a DB |
+| **Elasticsearch** | OSS / cloud | HNSW | Existing ES infra + hybrid | Native dense + BM25 hybrid |
+
+**pgvector** deserves special attention for full-stack teams because it adds vector search directly inside PostgreSQL with minimal extra infrastructure. It works well early, and teams often migrate to a dedicated vector database only once latency or throughput becomes the bottleneck.
+
+### Embedding Drift - The Migration Problem
+
+When switching embedding models, every existing vector becomes incompatible because different models produce vectors in different spaces. That means:
+
+- full corpus re-embedding
+- full index rebuild
+- retrieval validation before cutover
+- version-aware rollout and rollback planning
+
+Treat embedding model changes like real database migrations, not simple upgrades.
+
+### Production Implications
+
+- always use the same embedding model for indexing and querying
+- implement hybrid search by default for production retrieval
+- add a cross-encoder re-ranker between ANN retrieval and LLM context injection
+- normalize vectors when the chosen similarity setup expects it
+- tune runtime parameters such as **ef_search** or **nprobe** without rebuilding the index
+- monitor retrieval quality separately from LLM output quality
+- start with simpler infrastructure such as **pgvector** when it is sufficient
+- plan embedding-model upgrades as full re-embedding migrations
+- remember that vector retrieval and LLM prompt caching are separate optimization layers
+
+### Real-World Usage
+
+- **Notion-style workspace search** -> semantic retrieval with workspace-level metadata filtering
+- **E-commerce search** -> combine dense retrieval with BM25 for product discovery
+- **LangChain / LlamaIndex pipelines** -> embeddings, vector retrieval, re-ranking, and LLM grounding
+- **Fraud or anomaly retrieval** -> compare new events against semantically similar historical patterns
+
 ## Transformers
 
 **Transformers** are a type of deep learning model designed to process sequential data using **attention** instead of recurrence like **RNNs** or convolution like **CNNs**. They were introduced in the paper **"Attention Is All You Need"** and became the backbone of modern AI systems such as **GPT**, **BERT**, **ViT**, and many multimodal models.
@@ -493,6 +1258,22 @@ Transformers are neural network architectures that use **attention** to process 
 - **conversation history** -> all previous turns
 - **current user query** -> the latest request
 
+### Context Assembly Flow
+
+```text
+System Prompt
+-> Few-Shot Examples (optional)
+-> Conversation History
+-> Retrieved RAG Chunks (optional)
+-> Current User Query
+-> Full Context Assembled
+-> Tokenization
+-> Context Window Check
+-> Prefill
+-> Decode
+-> Response
+```
+
 ### Why Context Matters
 
 This is one of the most important interview ideas:
@@ -578,6 +1359,8 @@ The main value of **RAG** is:
 - it allows use of **private** or **domain-specific** data
 - it avoids putting the entire knowledge base into every prompt
 
+For the storage, indexing, ANN search, metadata filtering, hybrid retrieval, and re-ranking side of this pipeline, see the **Vector Databases** section.
+
 #### RAG: Why, Where, How, When
 
 - **Why** -> to ground the model on relevant external knowledge and reduce hallucinations
@@ -629,6 +1412,272 @@ Meaning of each role:
 From the model's perspective, all of this becomes part of **context**, but the role structure helps shape behavior and instruction priority.
 
 Generation-time controls such as **temperature**, **top_p**, **max_tokens**, and related decoding settings are covered in the **Sampling Parameters** section below.
+
+## RAG - Retrieval Augmented Generation
+
+RAG is an architecture that gives an LLM access to an external, updatable knowledge base at inference time. Instead of relying purely on memorized training weights, the system retrieves relevant information and injects it into the prompt context so the model can answer using grounded, current, and verifiable sources.
+
+RAG directly addresses two major LLM limitations:
+
+- **knowledge cutoff** -> model weights are frozen after training, so they do not include newly created information
+- **hallucination** -> when the model does not know something, it may still generate a fluent but incorrect answer
+
+With RAG, the model's role shifts from "recall the answer from weights" to "reason over retrieved evidence and generate the answer from that evidence."
+
+### RAG vs Fine-Tuning
+
+**Fine-tuning** is best for:
+
+- behavior
+- style
+- response format
+- task adaptation
+
+**RAG** is best for:
+
+- factual grounding
+- private knowledge bases
+- frequently updated data
+- source-backed document question answering
+
+Practical production pattern:
+
+- fine-tune for behavior and formatting
+- use RAG for factual knowledge
+
+### End-to-End RAG Flow
+
+```text
+INDEXING PIPELINE (offline):
+Raw Documents
+-> Loading + Preprocessing
+-> Chunking
+-> Embedding Model
+-> Dense Vectors + Metadata
+-> Vector DB
+-> Optional Sparse Index
+
+QUERYING PIPELINE (real-time):
+User Query
+-> Query Transformation
+-> Dense Retrieval + Sparse Retrieval
+-> RRF Fusion
+-> Cross-Encoder Re-ranking
+-> Context Assembly
+-> LLM Generation
+-> Optional Validation
+-> Final Response
+```
+
+### Document Loading and Preprocessing
+
+Before chunking and embedding, raw documents have to be loaded and cleaned. This stage is often underestimated, but weak preprocessing silently degrades retrieval quality regardless of how good the later components are.
+
+Common loaders include:
+
+- PDF loaders
+- web scrapers
+- database connectors
+- API connectors
+- code and file parsers
+
+Key preprocessing challenges:
+
+- **PDF parsing** -> scanned PDFs need OCR; multi-column layouts can break reading order; tables often get corrupted
+- **HTML cleanup** -> navigation, headers, footers, and ads must be stripped
+- **deduplication** -> duplicated documents or near-duplicates can dominate retrieval
+- **metadata extraction** -> title, page number, author, timestamp, URL, section header, and source information should be preserved
+
+Why this matters:
+
+- better preprocessing improves retrieval quality before any embedding or ANN search happens
+- metadata is essential for filters, attribution, and debugging
+
+### Chunking - The Foundation of Retrieval Quality
+
+Chunking is one of the single most important design choices in a RAG pipeline. The embedding model embeds the chunk as a whole. If the chunk is badly formed, retrieval quality drops no matter how good the embedding model or vector database is.
+
+Important chunking approaches:
+
+- **fixed-size chunking** -> split every N tokens with overlap; simple and strong baseline
+- **recursive chunking** -> split at paragraph, then sentence, then smaller units if needed
+- **sentence-level chunking** -> clean boundaries, but chunk sizes may vary too much
+- **semantic chunking** -> split where semantic similarity drops sharply
+- **parent-child chunking** -> index small chunks for precision but inject larger parent chunks for richer context
+
+Good default guidance:
+
+- **256-512 tokens**
+- **10-20% overlap**
+
+Why chunking matters so much:
+
+- too large -> the embedding mixes unrelated ideas and retrieval becomes noisy
+- too small -> the chunk lacks enough context to be useful
+- no overlap -> meaning across boundaries gets lost
+
+### Query Transformation - Improving Retrieval Before Search
+
+The user's original query is often not the best retrieval query. Query transformation rewrites or expands the query before retrieval.
+
+Common techniques:
+
+- **query rewriting** -> rewrite the question into a more retrieval-friendly form
+- **HyDE** -> generate a hypothetical ideal answer document, embed that, and use it for retrieval
+- **multi-query retrieval** -> generate multiple phrasings and retrieve for each
+- **query decomposition** -> split a complex question into simpler sub-queries
+- **step-back prompting** -> generate a broader, more abstract version of the query and retrieve supporting background context
+
+These techniques are especially useful when there is a vocabulary mismatch between the user's phrasing and the documents' phrasing.
+
+### Retrieval - Dense, Sparse, and Hybrid
+
+**Dense retrieval**:
+
+- uses embeddings
+- captures semantics, synonyms, and paraphrases
+- may miss exact keywords, IDs, and acronyms
+
+**Sparse retrieval**:
+
+- uses BM25 or related lexical retrieval
+- handles exact keyword matching very well
+- misses semantic equivalence
+
+**Hybrid retrieval** combines both and is usually the production default. Results from the dense and sparse retrieval paths are often merged with **Reciprocal Rank Fusion (RRF)**.
+
+This is why serious production RAG systems usually avoid dense-only retrieval.
+
+### Re-Ranking - Precision on the Shortlist
+
+ANN retrieval finds the right neighborhood quickly, but ranking inside that neighborhood is often imperfect.
+
+**Bi-encoder retrieval**:
+
+- query and documents are encoded separately
+- fast and scalable
+- lower precision
+
+**Cross-encoder re-ranking**:
+
+- query and document are processed together
+- much better relevance judgment
+- much slower, so only used on a small shortlist
+
+Standard production pattern:
+
+```text
+Dense + Sparse Retrieval
+-> Top-50 Candidates
+-> Cross-Encoder Re-ranker
+-> Top-5 Chunks
+-> Inject into LLM Context
+```
+
+Re-ranking is one of the highest-ROI improvements to a naive RAG system.
+
+### Context Assembly
+
+Retrieved chunks must be assembled carefully before being passed to the LLM.
+
+Important considerations:
+
+- **ordering matters** because of the lost-in-the-middle problem
+- include **source metadata** for attribution and citations
+- respect the **context window budget**
+- decide between **stuffing** all chunks at once vs iterative refinement or compression
+
+A practical rule:
+
+- place the most relevant chunks at the beginning and end of the context block
+
+### Advanced RAG Patterns
+
+More advanced RAG systems go beyond a single retrieve-then-generate step.
+
+Important patterns:
+
+- **Self-RAG** -> retrieve, answer, then self-evaluate grounding and faithfulness
+- **Corrective RAG (CRAG)** -> add a retrieval-quality evaluator and retry or escalate when retrieval is weak
+- **Agentic RAG** -> let an agent decide when and how many times to retrieve
+- **Multi-hop RAG** -> perform retrieval over multiple dependent sub-questions
+- **Graph RAG** -> retrieve over entities and relationships instead of only chunk vectors
+
+These patterns matter for complex questions where one-shot retrieval is not enough.
+
+### RAG Evaluation
+
+RAG must be evaluated at both the retrieval layer and the generation layer.
+
+**Retrieval metrics**:
+
+- **Recall@K**
+- **Precision@K**
+- **MRR**
+- **NDCG**
+
+**Generation metrics**:
+
+- **faithfulness**
+- **answer relevance**
+- **context relevance**
+- **context recall**
+
+Frameworks like **RAGAs** are commonly used because they separate these concerns more clearly than a single end-to-end accuracy number.
+
+### RAG Failure Modes and Mitigations
+
+Important failure modes:
+
+- **retrieval failure** -> wrong chunks are retrieved
+- **context poisoning** -> retrieved documents contain misleading, outdated, or malicious content
+- **lost-in-the-middle** -> the model ignores relevant chunks placed in the middle of long context
+- **semantic gap** -> user query wording differs too much from source document wording
+- **chunk boundary problem** -> the needed answer spans chunk boundaries
+
+Typical mitigations:
+
+- better chunking
+- better embeddings
+- hybrid retrieval
+- re-ranking
+- metadata filtering
+- query transformation
+- context ordering
+
+### Production RAG Architecture
+
+A production RAG system is more than a vector DB plus an LLM call.
+
+Typical production components:
+
+- **document ingestion pipeline** -> handles new, updated, and deleted documents
+- **query pipeline** -> transformation, retrieval, re-ranking, context assembly, generation
+- **observability** -> log queries, retrieved chunks, scores, context, and responses
+- **feedback loop** -> capture user feedback and use it to improve retrieval
+- **index management** -> support upserts, deletions, versioning, and re-embedding
+- **caching** -> cache embeddings, prompt prefixes, or repeated retrieval results where appropriate
+
+Deletion handling is especially important. Stale chunks from deleted or outdated documents silently degrade retrieval quality and are difficult to debug if the ingestion pipeline does not manage index updates correctly.
+
+### Real-World Usage
+
+- **Notion-style knowledge search** -> workspace documents embedded, filtered, retrieved, and cited
+- **GitHub Copilot-style code retrieval** -> code chunks retrieved with code-specific embeddings and parent-child context
+- **Enterprise legal AI** -> contracts chunked semantically, re-ranked, cited, and validated before answer delivery
+- **Customer support AI** -> combine vector retrieval with CRM or account-specific context for grounded support answers
+
+### Production Implications
+
+- chunking strategy is one of the highest-leverage decisions in RAG
+- use hybrid search by default for keyword-sensitive domains
+- add a cross-encoder re-ranker early
+- place the most relevant chunks at the beginning and end of context
+- log full retrieval traces for debugging
+- implement deletion handling and index versioning
+- evaluate faithfulness and retrieval quality separately
+- use query transformation techniques when there is vocabulary mismatch
+- for multi-document synthesis tasks, evaluate whether Graph RAG or multi-hop RAG is needed
 
 ## Logits
 
@@ -1295,3 +2344,218 @@ Final Generated Response
 - **Stop sequences** are a cost optimization and are especially useful in structured generation tasks
 - **Prompt caching** caches the input prompt, not the output sampling behavior
 - For A/B testing model outputs, fix the **seed** to isolate prompt changes from randomness
+
+## AI Agents
+
+An **AI agent** is an LLM that has been given the ability to take actions in the world by using tools. A regular LLM call is passive: you send a prompt, it returns a response, and the interaction ends. An agent is different because it runs in a loop. The LLM acts as the brain, the tools act as the hands, and the system repeatedly reasons, acts, observes, and decides what to do next until the goal is complete.
+
+### Agent Loop
+
+```text
+User Goal
+-> Agent (LLM as brain)
+-> THINK
+-> ACT
+-> OBSERVE
+-> Enough information to answer?
+   -> NO  -> loop back to THINK
+   -> YES -> Final Response
+```
+
+This is the key conceptual difference between a normal LLM call and an agent:
+
+- a normal LLM call answers once
+- an agent can operate across many steps
+- tool results are fed back into context
+- the model keeps deciding what to do next until it completes the task
+
+### The ReAct Pattern - Reasoning + Acting
+
+The dominant pattern for agent systems is **ReAct (Reasoning + Acting)**.
+
+At each loop iteration, the model conceptually produces:
+
+- **Thought** -> what it knows, what it lacks, and what it should do next
+- **Action** -> the tool call it wants to make
+- **Observation** -> the tool result that comes back and is injected into context
+
+Why it matters:
+
+- explicit reasoning improves tool choice
+- acting connects the LLM to external systems
+- observation allows the model to revise its strategy step by step
+
+**Example - Travel Planning Agent:** a user asks for the cheapest flight under a budget. The agent searches flights, checks payment information, books the option that fits the goal, and only then returns the final confirmation. The important point is that no single prompt contains the whole answer in advance; the answer is built through the loop.
+
+### Tool Use - How Agents Interact With the World
+
+Tools are functions the agent can invoke. The LLM does not execute code directly. Instead, it emits a structured tool call such as a function name plus JSON arguments. The runtime executes the tool, returns the result, and injects that result back into the model context.
+
+This is how the model's reasoning is connected to real-world actions.
+
+Common tool categories:
+
+- **information retrieval** -> web search, vector DB lookup, SQL queries, document readers
+- **code execution** -> Python, JavaScript, shell, notebooks, sandboxes
+- **external APIs** -> weather, payments, CRMs, maps, booking systems
+- **file operations** -> reading, writing, parsing PDFs, spreadsheets, documents
+- **browser control** -> click, fill, navigate, scrape
+- **communication** -> email, Slack, calendar, ticketing
+- **memory operations** -> read from or write to memory stores
+
+Tool descriptions matter a lot. The model selects tools from their descriptions, so vague or generic tool descriptions produce weak tool selection. Good descriptions explain:
+
+- when to use the tool
+- when not to use the tool
+- what inputs it expects
+- what kind of result it returns
+
+### Memory - How Agents Remember
+
+A pure LLM is stateless. Agents need memory in order to handle long tasks and, in many cases, multi-session behavior.
+
+Four important memory types appear in agent systems:
+
+- **In-context memory** -> current working memory inside the context window
+- **External memory** -> vector-store memory of past interactions and prior tasks
+- **Entity memory** -> exact structured facts such as user profile, account details, preferences, project state
+- **Procedural memory** -> knowledge and skills stored in model weights from training
+
+**Example - Personal Assistant Agent:** the agent may retrieve the user's earlier meeting preferences from vector memory, look up the user's calendar account from entity memory, reason in-context about the current request, and then use a calendar API to act. All these memory layers work together.
+
+### Planning - How Agents Break Down Complex Goals
+
+Simple ReAct is often enough for straightforward tasks. More complex tasks need explicit planning.
+
+Important planning styles:
+
+- **Plan-and-Execute** -> create a plan first, then execute each step
+- **Tree of Thoughts (ToT)** -> explore multiple possible reasoning branches
+- **MCTS (Monte Carlo Tree Search)** -> search over possible trajectories and estimate which are most promising
+
+Why planning matters:
+
+- improves reliability on long tasks
+- reduces random wandering
+- makes multi-step goals more manageable
+
+**Example - Market Research Agent:** instead of immediately searching randomly, the agent first creates a plan such as finding competitors, collecting pricing, gathering reviews, and then synthesizing the results into a final comparison.
+
+### Multi-Agent Systems
+
+Single agents eventually hit limits:
+
+- context windows fill up
+- one agent may not be specialized enough
+- there is no parallelism
+
+Multi-agent systems solve this by using multiple specialized agents coordinated by an orchestrator.
+
+```text
+User Goal
+-> Orchestrator Agent
+-> Subtask Decomposition
+   -> Research Agent
+   -> Code Agent
+   -> Data Agent
+   -> Writer Agent
+-> Orchestrator Aggregates Results
+-> Critic / Validator Agent
+-> Final Response
+```
+
+Common communication patterns:
+
+- **Sequential** -> one agent's output becomes the next agent's input
+- **Parallel** -> multiple agents work independently at the same time
+- **Hierarchical** -> orchestrators delegate to sub-orchestrators and workers
+- **Debate / Critique** -> multiple agents produce candidates and another agent critiques or selects
+
+Common frameworks:
+
+- **LangGraph** -> graph-based workflows with conditional edges
+- **AutoGen** -> agents as conversational entities
+- **CrewAI** -> role-based agent crews
+- **OpenAI Assistants / managed agent runtimes** -> hosted tool-calling and workflow infrastructure
+
+### Agent State Management Across Long Tasks
+
+As agents run for many steps, context can fill up with:
+
+- tool results
+- observations
+- intermediate reasoning
+- plan progress
+
+State-management strategies include:
+
+- **summarization** -> compress old history into compact summaries
+- **working-memory pruning** -> drop raw observations once their conclusions are retained
+- **external state stores** -> persist intermediate outputs outside the prompt
+- **checkpointing** -> save task state so long-running jobs can resume after interruption
+
+These are not optional at scale. Without them, long-running agents will eventually exceed context limits or become expensive and unstable.
+
+### Agentic Failure Modes and Reliability
+
+Agents are less reliable than single-turn LLM calls because mistakes compound across steps.
+
+Important failure modes:
+
+- **hallucinated tool calls** -> wrong filenames, wrong endpoints, wrong table names, bad parameters
+- **infinite loops** -> the agent repeats the same failed action again and again
+- **reward hacking / goal misalignment** -> the agent technically satisfies the goal but not the user's true intent
+- **context poisoning / prompt injection** -> malicious tool outputs manipulate the agent
+- **irreversible actions** -> sending emails, deleting files, making purchases, or changing production systems unsafely
+
+Typical mitigations:
+
+- strict tool schemas and validation
+- step limits
+- loop detection
+- sanitizing tool outputs
+- explicit permissions
+- human checkpoints for irreversible actions
+
+### Human-in-the-Loop (HITL)
+
+Full autonomy is fine only for low-stakes and reversible tasks. High-stakes or irreversible actions require **human-in-the-loop** controls.
+
+Common HITL patterns:
+
+- **interrupt and confirm** -> pause before an irreversible action
+- **approval workflows** -> present plan before execution
+- **async review** -> perform work in draft form and wait for approval before finalizing
+
+This is one of the biggest differences between a demo agent and a production agent.
+
+### Agent Evaluation
+
+Evaluating agents is harder than evaluating a single LLM answer because the final output is only one part of the system.
+
+Important evaluation dimensions:
+
+- **trajectory evaluation** -> assess the full sequence of thought, action, and observation
+- **task completion rate** -> percentage of tasks completed successfully end-to-end
+- **step efficiency** -> how many steps were used relative to what was necessary
+- **tool call accuracy** -> whether the right tools and parameters were chosen
+
+A correct final answer can still come from a brittle or unsafe trajectory, so the full path matters.
+
+### Real-World Usage
+
+- **GitHub Copilot Workspace** -> orchestrates code understanding, implementation, testing, and PR generation across multiple subtasks
+- **Devin-style engineering agents** -> combine terminal use, code execution, web browsing, and debugging loops
+- **Customer Support Agents** -> combine retrieval, CRM lookups, ticketing tools, and escalation logic
+- **LangGraph / AutoGPT-style systems** -> graph-based or loop-based multi-step task execution with tool use
+
+### Production Implications
+
+- always set a maximum step limit
+- require HITL for irreversible actions such as payments, deletions, or outbound communication
+- invest heavily in precise tool descriptions
+- log the full agent trajectory for debugging
+- implement context-window management for long-running tasks
+- sanitize tool outputs before injecting them into the context
+- start with single-agent ReAct before introducing multi-agent complexity
+- evaluate trajectory quality, not just final answers
