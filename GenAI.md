@@ -606,6 +606,273 @@ Why this matters for production system design:
 - agentic systems are engineered approximations of autonomy built on top of fundamentally narrow, stateless models
 - you should never assume the model "understands" context the way a human does
 
+## Fine-Tuning
+
+Fine-tuning is the process of taking a pretrained LLM and continuing to train it on a smaller, targeted dataset so the model adapts to a specific use case. The model already knows language, general reasoning, and broad world knowledge. Fine-tuning adjusts those existing weights so the model emphasizes the right behavior, vocabulary, format, tone, or domain patterns for a particular task. It does not teach the model entirely new reasoning abilities from scratch.
+
+There are two independent dimensions in fine-tuning:
+
+- **what you are teaching** -> the objective and data type, such as **SFT**, **continued pretraining**, **instruction tuning**, **RLHF**, or **DPO**
+- **how much of the model you are changing** -> the efficiency dimension, such as **full fine-tuning**, **LoRA**, **QLoRA**, **prefix tuning**, **prompt tuning**, or **IA3**
+
+These dimensions are independent. For example, **SFT** can be done with full fine-tuning or with **LoRA**.
+
+### When to Fine-Tune vs Alternatives
+
+Always try **prompt engineering** first. A strong system prompt plus a few-shot examples is cheaper, faster, and easier to update. Fine-tune only when prompting repeatedly fails to achieve the required behavior consistently.
+
+Important rule:
+
+- do **not** fine-tune just to add factual knowledge
+- factual knowledge belongs in **RAG**
+- fine-tuning is best for **behavior, style, tone, format, and domain adaptation**
+
+The best production systems often combine both:
+
+- **fine-tuning** for behavior and output format
+- **RAG** for factual grounding
+
+### Fine-Tuning Flow
+
+```text
+Pretrained Base Model
+-> Choose Training Objective
+   (SFT / Continued Pretraining / RLHF / DPO / Instruction Tuning)
+-> Choose Efficiency Method
+   (Full Fine-Tuning / LoRA / QLoRA / Prefix Tuning / Prompt Tuning / IA3)
+-> Train on Targeted Data
+-> Adapted Model
+-> Optional RAG for factual grounding
+```
+
+### What You Are Teaching - Training Methods
+
+#### Supervised Fine-Tuning (SFT)
+
+**SFT** is the most common form of fine-tuning. The model is trained on:
+
+- instruction
+- ideal response
+
+pairs using next-token prediction loss, usually computed only on the response tokens while the instruction tokens are masked.
+
+The most important point here is that **data quality dominates**. A small set of highly consistent, high-quality examples often beats a much larger set of mediocre examples. Because the model already knows how to reason and write, SFT is mostly teaching a specific behavioral pattern, and noisy examples corrupt that signal quickly.
+
+InstructGPT is the classic example here. It used only around **13,000** carefully curated SFT examples, yet that was enough to shift the behavior of a very large base model significantly. This is why interview answers should emphasize that in SFT, **quality beats quantity** much more than people expect.
+
+Template correctness also matters. Chat-tuned models expect the correct conversation format, and using the wrong template can cause silent failure where training appears to run but the model does not learn the desired behavior.
+
+Examples:
+
+- **LLaMA-style templates** -> `[INST] ... [/INST]`
+- **ChatML-style templates** -> `<|im_start|>user ... <|im_end|>`
+- if the training data does not match the model's expected chat template, the model may train successfully but still fail to behave correctly at inference time
+
+#### Continued Pretraining (Domain Adaptive Pretraining)
+
+**Continued pretraining** uses raw domain text rather than instruction-response pairs. The model is further trained with the same next-token prediction objective used in original pretraining.
+
+This is appropriate when the model does not understand the domain language well enough yet, such as:
+
+- finance
+- medicine
+- law
+- specialized code or scientific corpora
+
+The idea is:
+
+- first teach the model the domain language
+- then fine-tune or align it for tasks inside that domain
+
+This is the path used for domain-heavy systems such as **financial**, **medical**, and **scientific** LLMs. A common mental model is:
+
+- **continued pretraining** teaches the model how the domain talks
+- **SFT / instruction tuning** teaches the model how to perform tasks in that domain
+
+#### Instruction Fine-Tuning
+
+**Instruction fine-tuning** is SFT performed on a large and diverse set of instruction-following examples so the model becomes broadly better at following many kinds of tasks rather than specializing narrowly on one.
+
+This is what usually turns a raw base model into an **Instruct** or **Chat** model.
+
+#### RLHF
+
+**RLHF (Reinforcement Learning from Human Feedback)** aligns the model to human preferences beyond what SFT alone can do.
+
+Typical flow:
+
+1. the SFT model generates multiple responses
+2. human raters rank them
+3. a reward model is trained on those rankings
+4. the LLM is optimized with PPO to maximize reward while staying close to the SFT model via a **KL penalty**
+
+This is powerful, but expensive and operationally complex.
+
+The **KL penalty** matters because without it the model can start gaming the reward model instead of genuinely improving. This is the classic **reward hacking** problem.
+
+#### DPO
+
+**DPO (Direct Preference Optimization)** aims for the same preference-alignment goal as RLHF, but removes the separate reward model and RL loop.
+
+Instead, it trains directly on:
+
+- prompt
+- chosen response
+- rejected response
+
+This makes alignment much simpler and more stable. It has become the default alignment approach for many modern open-source and practical production fine-tuning setups.
+
+Interview angle:
+
+- **RLHF** -> more complex pipeline, separate reward model, PPO
+- **DPO** -> one-stage preference optimization, simpler and usually more stable
+- both aim to align the model with human preference, but **DPO** is much easier for most teams to operate
+
+### How Much You Change - Efficiency Methods
+
+#### Full Fine-Tuning
+
+**Full fine-tuning** updates every model parameter. It is the most flexible option, but also the most expensive. For large models, it often requires infrastructure similar to pretraining-scale setups.
+
+#### LoRA
+
+**LoRA (Low-Rank Adaptation)** is the most important PEFT method.
+
+Core idea:
+
+- the weight update does not need to use the full parameter space
+- instead of updating the full matrix directly, LoRA learns two small low-rank matrices
+- the original base weights remain frozen
+
+Mathematically, the update is written as:
+
+```text
+Delta W = A x B
+```
+
+So instead of training the full weight matrix **W**, the model only learns the low-rank update **A x B**. This is why LoRA reduces trainable parameters so dramatically.
+
+Benefits:
+
+- far fewer trainable parameters
+- much lower GPU memory usage
+- adapters can be merged into the base weights
+- adapters can also remain separate and be hot-swapped at inference time
+
+Typical practical pattern:
+
+- start with small rank values such as `r = 8` or `r = 16`
+- apply LoRA first to attention projections such as **Q** and **V**
+- expand to more modules only if the task needs more adaptation capacity
+
+This is one of the main reasons LoRA is so practical for multi-tenant and multi-customer deployments.
+
+#### QLoRA
+
+**QLoRA** applies LoRA on top of a quantized 4-bit base model. The base model stays frozen in quantized form while the adapters are trained in higher precision.
+
+Why it matters:
+
+- dramatically reduces memory requirements
+- enables large-model fine-tuning on consumer or modest GPUs
+- made open-source LLM fine-tuning widely accessible
+
+Important detail:
+
+- QLoRA usually uses **NF4 4-bit quantization**, which is designed to work well for neural network weight distributions
+- the base model is frozen and quantized, while the LoRA adapters are still trained in higher precision
+- quality is often very close to standard LoRA, which is why QLoRA became so widely adopted
+
+#### Prompt Tuning, Prefix Tuning, and IA3
+
+Other PEFT methods include:
+
+- **Prompt Tuning** -> learn soft prompt vectors prepended to the input
+- **Prefix Tuning** -> inject learned prefix vectors at transformer layers
+- **IA3** -> learn scaling vectors applied to internal activations
+
+These are lighter than LoRA, but often less expressive for difficult adaptation tasks.
+
+Use them when:
+
+- adaptation needs are relatively modest
+- memory efficiency matters more than maximum flexibility
+- LoRA would be unnecessary overkill for the task
+
+### Catastrophic Forgetting
+
+One of the most important fine-tuning risks is **catastrophic forgetting**. If the model is trained too aggressively on a narrow dataset, it may become better on the target task while losing general capability.
+
+Typical symptoms:
+
+- strong performance on the fine-tuning task
+- unexpected failure on nearby tasks the base model previously handled well
+
+Common mitigations:
+
+- **LoRA / QLoRA**
+- low learning rates
+- early stopping
+- mixing in more general data
+- careful dataset design
+
+Useful interview detail:
+
+- full fine-tuning often uses very small learning rates such as `1e-5` to `1e-4`
+- LoRA commonly tolerates somewhat higher learning rates such as `1e-4` to `3e-4`
+- one of the safest strategies is to mix some general instruction data with the domain data so the model does not over-specialize
+
+### Fine-Tuning Data Quality
+
+Data quality is often the biggest determinant of fine-tuning success, more important than model size or long training runs.
+
+The key idea is that the model already knows language and broad reasoning. Fine-tuning is mostly teaching **behavioral patterns**, so inconsistent or low-quality examples create a very noisy signal. A few hundred highly consistent examples can outperform tens of thousands of mediocre ones.
+
+Key principles:
+
+- **diversity** -> cover the real range of user inputs
+- **consistency** -> keep output style and format stable
+- **low ambiguity** -> examples should have a clearly correct target behavior
+- **balanced difficulty** -> include easy, medium, and hard cases
+
+Practical quantity guidance:
+
+- behavior or tone adjustment -> often `100-1000` high-quality examples can be enough
+- task-specific fine-tuning -> often `1,000-10,000`
+- stronger domain adaptation -> often `10,000-100,000+`
+
+Synthetic data generation with a strong LLM is now common, but it still needs filtering and quality control.
+
+Best practice is:
+
+- generate synthetic examples with a strong model
+- filter them for correctness and formatting
+- keep only examples that match the exact behavior you want the model to learn
+
+### Decision Framework
+
+| Situation | Best Approach |
+| --- | --- |
+| Need current or specific factual knowledge | RAG |
+| Need source attribution in responses | RAG |
+| Task already works with prompting | Prompting only |
+| Need highly consistent output format or schema | SFT |
+| Need domain vocabulary or tone | SFT or continued pretraining |
+| Need to reduce prompt length at scale | SFT |
+| Need alignment to human preferences | DPO or RLHF |
+| Limited GPU memory | LoRA or QLoRA |
+| Need many customized variants of one base model | LoRA with adapter swapping |
+| Need both behavior change and factual grounding | Fine-tuning + RAG |
+
+### Real-World Usage
+
+- **BloombergGPT-style domain adaptation** -> continued pretraining on financial text before downstream task adaptation
+- **ChatGPT-style alignment** -> GPT-3.5 style base model -> SFT -> RLHF with human raters, reward model, and PPO
+- **LLaMA Instruct-style models** -> instruction tuning plus modern preference alignment such as DPO
+- **Enterprise assistants** -> fine-tune output format, tone, and citation style, then combine with **RAG** for factual grounding
+- **Multi-tenant SaaS** -> one base model with many hot-swappable **LoRA** adapters for customer-specific behavior
+- **Morgan Stanley-style internal assistants** -> fine-tune response behavior for enterprise usage, but still rely on retrieval over proprietary documents for current factual answers
+
 ## Tokens
 
 A **token** is the smallest unit of text that an AI model reads and processes. It's not exactly a word - it's a chunk of characters. AI models don't read text like humans. They convert text into numbers first. **Tokens** are that conversion unit - text gets split into tokens, tokens get converted to numbers, and the model works on those numbers. Think of tokens like Lego bricks: a sentence is a Lego structure, and before the model can work with it, it breaks the structure into individual bricks (**tokens**).
